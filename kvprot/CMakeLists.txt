@@ -37,6 +37,8 @@ foreach(include_dir
     endif()
 endforeach()
 
+find_package(Threads REQUIRED)
+
 if ("${BEP_VERIFY}" STREQUAL "true")
     set(CMAKE_C_OUTPUT_EXTENSION_REPLACE 1)
     add_compile_definitions(
@@ -76,6 +78,8 @@ endif()
 if (EXISTS "${HAOTIAN_SDK_ROOT}/third")
     target_link_directories(kvprot PRIVATE "${HAOTIAN_SDK_ROOT}/third")
 endif()
+
+target_link_libraries(kvprot PRIVATE Threads::Threads)
 
 set(INSTALL_INCLUDE_DIR include)
 set(INSTALL_LIBRARY_DIR lib)

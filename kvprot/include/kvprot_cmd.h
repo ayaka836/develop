@@ -24,10 +24,19 @@ extern "C" {
 #define KVPROT_CMD_STATUS_ALLOC_FAIL 0x07
 #define KVPROT_CMD_STATUS_TIMEOUT 0x09
 
-#define KVPROT_DELETE_BDM_TIMEOUT_MS 1000
+#define KVPROT_DELETE_BDM_TIMEOUT_MS 10000
+#define KVPROT_CMD_TIMEOUT_SCAN_INTERVAL_MS 100
+#define KVPROT_CMD_TIMEOUT_WHEEL_SLOT_NUM 64
 
 #define KVPROT_CMD_F_NEED_SCHEDULE 0x1
 #define KVPROT_CMD_F_NEED_RX_DATA 0x2
+
+typedef enum tagKVPROT_CMD_STATE {
+    KVPROT_CMD_STATE_INIT = 0,
+    KVPROT_CMD_STATE_WAIT_BACKEND,
+    KVPROT_CMD_STATE_COMPLETE,
+    KVPROT_CMD_STATE_TIMEOUT,
+} KVPROT_CMD_STATE;
 
 typedef struct tagKVPROT_CMD_SQE {
     uint16_t opcode : 8;
@@ -65,6 +74,7 @@ typedef struct tagKVPROT_CMD_CQE {
 struct tagKVPROT_CMD;
 
 typedef struct tagKVPROT_CMD_OPS {
+    int32_t (*validate)(struct tagKVPROT_CMD *cmd);
     int32_t (*execute)(struct tagKVPROT_CMD *cmd);
 } KVPROT_CMD_OPS;
 
@@ -76,12 +86,22 @@ typedef struct tagKVPROT_CMD_ENTRY {
 
 typedef struct tagKVPROT_CMD {
     scat_tgt_cmd_s drv_cmd;
+    spinlock_t lock;
+    KVPROT_CMD_STATE state;
+    bool resp_sent;
+    bool scat_done;
+    bool backend_done;
+    bool in_timeout_list;
+    uint32_t timeout_slot;
+    uint32_t timeout_round;
     KVPROT_CMD_SQE sqe;
     KVPROT_CMD_CQE cqe;
     KVPROT_CMD_ENTRY *entry;
     void *result_page_ctrl;
     void *data_page_ctrl;
     void *data_buf;
+    struct tagKVPROT_CMD *timeout_prev;
+    struct tagKVPROT_CMD *timeout_next;
     uint32_t data_len;
 } KVPROT_CMD;
 
@@ -96,8 +116,11 @@ void tgtGetKvSense(scat_error_code_e error_code, scat_cmd_cqe_s *cmd_cqe, void *
 
 void tgtKvCmdMarkBackendPending(KVPROT_CMD *cmd);
 void tgtKvCmdComplete(KVPROT_CMD *cmd, uint32_t status);
+void tgtKvCmdBackendDone(KVPROT_CMD *cmd, uint32_t status);
+void tgtKvCmdTimeoutScan(void);
 
 int32_t tgtKvDeleteExecute(KVPROT_CMD *cmd);
+int32_t tgtKvDeleteValidate(KVPROT_CMD *cmd);
 
 #ifdef __cplusplus
 }

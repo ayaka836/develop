@@ -32,10 +32,6 @@ extern "C" {
 #define KVPROT_ERROR(fmt, ...) DBG_LogError(DBG_LOGID_BUTT, "[KVPROT] " fmt, ##__VA_ARGS__)
 #endif
 
-#ifndef KVPROT_GET_TIME_MS
-#define KVPROT_GET_TIME_MS() 0ULL
-#endif
-
 typedef struct tagKVPROT_INIT_OPS {
     const char *desc;
     int32_t (*init)(void);
