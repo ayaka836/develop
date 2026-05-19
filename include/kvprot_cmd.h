@@ -29,6 +29,22 @@ extern "C" {
 #define KVPROT_CMD_F_NEED_SCHEDULE 0x1
 #define KVPROT_CMD_F_NEED_RX_DATA 0x2
 
+#define KVPROT_CMD_HANDLE_INVALID 0ULL
+#define KVPROT_CMD_CPU_INVALID 0xFFFFFFFFU
+
+typedef enum tagKVPROT_CMD_STATE {
+    KVPROT_CMD_STATE_ALLOC = 0,
+    KVPROT_CMD_STATE_PARSE,
+    KVPROT_CMD_STATE_WAIT_RX_DATA,
+    KVPROT_CMD_STATE_RX_DATA_DONE,
+    KVPROT_CMD_STATE_SCHEDULED,
+    KVPROT_CMD_STATE_EXECUTE,
+    KVPROT_CMD_STATE_WAIT_BACKEND,
+    KVPROT_CMD_STATE_COMPLETE,
+    KVPROT_CMD_STATE_DONE,
+    KVPROT_CMD_STATE_BUTT
+} KVPROT_CMD_STATE;
+
 typedef struct tagKVPROT_CMD_SQE {
     uint16_t opcode : 8;
     uint16_t rsvd1 : 5;
@@ -74,8 +90,24 @@ typedef struct tagKVPROT_CMD_ENTRY {
     KVPROT_CMD_OPS ops;
 } KVPROT_CMD_ENTRY;
 
+typedef struct tagKVPROT_CMD_TRACE {
+    uint32_t alloc_cpu;
+    uint32_t execute_cpu;
+    uint64_t alloc_time_ms;
+    uint64_t parse_time_ms;
+    uint64_t rx_data_time_ms;
+    uint64_t execute_time_ms;
+    uint64_t complete_time_ms;
+    KVPROT_CMD_STATE state;
+    uint16_t opcode;
+    uint16_t cmd_id;
+    uint32_t nsid;
+} KVPROT_CMD_TRACE;
+
 typedef struct tagKVPROT_CMD {
     scat_tgt_cmd_s drv_cmd;
+    uint64_t handle;
+    KVPROT_CMD_TRACE trace;
     KVPROT_CMD_SQE sqe;
     KVPROT_CMD_CQE cqe;
     KVPROT_CMD_ENTRY *entry;
@@ -93,6 +125,15 @@ void tgtParseKvTargetCmd(scat_tgt_cmd_s *drv_cmd);
 void tgtTargetRxKvData(scat_tgt_cmd_s *drv_cmd);
 void tgtTargetTgtCmdDone(scat_tgt_cmd_s *drv_cmd);
 void tgtGetKvSense(scat_error_code_e error_code, scat_cmd_cqe_s *cmd_cqe, void *session);
+
+uint64_t tgtKvCmdHandleAlloc(KVPROT_CMD *cmd);
+void tgtKvCmdHandleFree(KVPROT_CMD *cmd);
+KVPROT_CMD *tgtKvCmdGetByHandle(uint64_t handle);
+KVPROT_CMD *tgtKvCmdClaimByHandle(uint64_t handle);
+void tgtKvCmdMarkBackendPending(KVPROT_CMD *cmd);
+void tgtKvCmdComplete(KVPROT_CMD *cmd, uint32_t status);
+int32_t tgtKvCmdCompleteByHandle(uint64_t handle, uint32_t status);
+void tgtKvCmdDumpTrace(const KVPROT_CMD *cmd, const char *reason);
 
 int32_t tgtKvDeleteExecute(KVPROT_CMD *cmd);
 

@@ -9,6 +9,19 @@
 static uint32_t g_kvprot_cmd_part_id;
 static KVPROT_CMD_ENTRY *g_kvprot_cmd_entry_list[KVPROT_MAX_CMD_NUM];
 
+typedef struct tagKVPROT_CMD_HANDLE_SLOT {
+    KVPROT_CMD *cmd;
+    uint32_t generation;
+} KVPROT_CMD_HANDLE_SLOT;
+
+typedef struct tagKVPROT_CMD_HANDLE_TABLE {
+    spinlock_t lock;
+    uint32_t next_slot;
+    KVPROT_CMD_HANDLE_SLOT slots[KVPROT_CMD_MAX_CONCUR_COUNT];
+} KVPROT_CMD_HANDLE_TABLE;
+
+static KVPROT_CMD_HANDLE_TABLE g_kvprot_cmd_handle_table;
+
 static KVPROT_CMD_ENTRY g_kvprot_cmd_entry_set[] = {
     {
         KVPROT_CMD_OPCODE_DELETE,
@@ -18,6 +31,49 @@ static KVPROT_CMD_ENTRY g_kvprot_cmd_entry_set[] = {
         },
     },
 };
+
+static uint32_t tgtKvGetCurrentCpu(void)
+{
+    int32_t cpu = smp_processor_id();
+
+    return (cpu == RETURN_ERROR) ? KVPROT_CMD_CPU_INVALID : (uint32_t)cpu;
+}
+
+static uint64_t tgtKvGetTraceTimeMs(void)
+{
+    return KVPROT_GET_TIME_MS();
+}
+
+static void tgtKvCmdSetState(KVPROT_CMD *cmd, KVPROT_CMD_STATE state)
+{
+    if (cmd != NULL) {
+        cmd->trace.state = state;
+    }
+}
+
+void tgtKvCmdDumpTrace(const KVPROT_CMD *cmd, const char *reason)
+{
+    if (cmd == NULL) {
+        return;
+    }
+
+    KVPROT_ERROR("KV cmd trace, reason:%s handle:0x%llx state:%u opcode:%u cmd_id:%u nsid:%u "
+        "alloc_cpu:%u execute_cpu:%u alloc:%llu parse:%llu rx:%llu execute:%llu complete:%llu status:%u.",
+        (reason == NULL) ? "unknown" : reason,
+        cmd->handle,
+        cmd->trace.state,
+        cmd->trace.opcode,
+        cmd->trace.cmd_id,
+        cmd->trace.nsid,
+        cmd->trace.alloc_cpu,
+        cmd->trace.execute_cpu,
+        cmd->trace.alloc_time_ms,
+        cmd->trace.parse_time_ms,
+        cmd->trace.rx_data_time_ms,
+        cmd->trace.execute_time_ms,
+        cmd->trace.complete_time_ms,
+        cmd->cqe.status);
+}
 
 static void tgtKvFillResult(KVPROT_CMD *cmd, uint32_t status)
 {
@@ -44,6 +100,168 @@ static void tgtKvSendResponse(KVPROT_CMD *cmd)
     }
 
     drv_ops->send_resp(&cmd->drv_cmd);
+}
+
+static uint64_t tgtKvMakeCmdHandle(uint32_t slot, uint32_t generation)
+{
+    return (((uint64_t)generation) << 32) | ((uint64_t)slot + 1);
+}
+
+static bool tgtKvDecodeCmdHandle(uint64_t handle, uint32_t *slot, uint32_t *generation)
+{
+    uint32_t handle_slot;
+
+    if (handle == KVPROT_CMD_HANDLE_INVALID || slot == NULL || generation == NULL) {
+        return false;
+    }
+
+    handle_slot = (uint32_t)(handle & 0xFFFFFFFFULL);
+    if (handle_slot == 0 || handle_slot > KVPROT_CMD_MAX_CONCUR_COUNT) {
+        return false;
+    }
+
+    *slot = handle_slot - 1;
+    *generation = (uint32_t)(handle >> 32);
+    if (*generation == 0) {
+        return false;
+    }
+
+    return true;
+}
+
+uint64_t tgtKvCmdHandleAlloc(KVPROT_CMD *cmd)
+{
+    uint32_t i;
+    uint32_t slot;
+    uint64_t handle = KVPROT_CMD_HANDLE_INVALID;
+
+    if (cmd == NULL) {
+        return KVPROT_CMD_HANDLE_INVALID;
+    }
+
+    spin_lock(&g_kvprot_cmd_handle_table.lock);
+    for (i = 0; i < KVPROT_CMD_MAX_CONCUR_COUNT; i++) {
+        slot = (g_kvprot_cmd_handle_table.next_slot + i) % KVPROT_CMD_MAX_CONCUR_COUNT;
+        if (g_kvprot_cmd_handle_table.slots[slot].cmd != NULL) {
+            continue;
+        }
+
+        g_kvprot_cmd_handle_table.slots[slot].generation++;
+        if (g_kvprot_cmd_handle_table.slots[slot].generation == 0) {
+            g_kvprot_cmd_handle_table.slots[slot].generation = 1;
+        }
+
+        g_kvprot_cmd_handle_table.slots[slot].cmd = cmd;
+        g_kvprot_cmd_handle_table.next_slot = (slot + 1) % KVPROT_CMD_MAX_CONCUR_COUNT;
+        handle = tgtKvMakeCmdHandle(slot, g_kvprot_cmd_handle_table.slots[slot].generation);
+        cmd->handle = handle;
+        break;
+    }
+    spin_unlock(&g_kvprot_cmd_handle_table.lock);
+
+    if (handle == KVPROT_CMD_HANDLE_INVALID) {
+        KVPROT_ERROR("Allocate kv command handle failed.");
+    } else {
+        KVPROT_INFO("Allocate kv command handle:0x%llx.", handle);
+    }
+
+    return handle;
+}
+
+void tgtKvCmdHandleFree(KVPROT_CMD *cmd)
+{
+    uint32_t slot;
+    uint32_t generation;
+
+    if (cmd == NULL || !tgtKvDecodeCmdHandle(cmd->handle, &slot, &generation)) {
+        return;
+    }
+
+    spin_lock(&g_kvprot_cmd_handle_table.lock);
+    if (g_kvprot_cmd_handle_table.slots[slot].cmd == cmd &&
+        g_kvprot_cmd_handle_table.slots[slot].generation == generation) {
+        g_kvprot_cmd_handle_table.slots[slot].cmd = NULL;
+    }
+    spin_unlock(&g_kvprot_cmd_handle_table.lock);
+}
+
+KVPROT_CMD *tgtKvCmdGetByHandle(uint64_t handle)
+{
+    uint32_t slot;
+    uint32_t generation;
+    KVPROT_CMD *cmd = NULL;
+
+    if (!tgtKvDecodeCmdHandle(handle, &slot, &generation)) {
+        return NULL;
+    }
+
+    spin_lock(&g_kvprot_cmd_handle_table.lock);
+    if (g_kvprot_cmd_handle_table.slots[slot].generation == generation) {
+        cmd = g_kvprot_cmd_handle_table.slots[slot].cmd;
+    }
+    spin_unlock(&g_kvprot_cmd_handle_table.lock);
+
+    return cmd;
+}
+
+KVPROT_CMD *tgtKvCmdClaimByHandle(uint64_t handle)
+{
+    uint32_t slot;
+    uint32_t generation;
+    KVPROT_CMD *cmd = NULL;
+
+    if (!tgtKvDecodeCmdHandle(handle, &slot, &generation)) {
+        return NULL;
+    }
+
+    spin_lock(&g_kvprot_cmd_handle_table.lock);
+    if (g_kvprot_cmd_handle_table.slots[slot].generation == generation) {
+        cmd = g_kvprot_cmd_handle_table.slots[slot].cmd;
+        g_kvprot_cmd_handle_table.slots[slot].cmd = NULL;
+    }
+    spin_unlock(&g_kvprot_cmd_handle_table.lock);
+
+    return cmd;
+}
+
+void tgtKvCmdMarkBackendPending(KVPROT_CMD *cmd)
+{
+    if (cmd == NULL) {
+        return;
+    }
+
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_WAIT_BACKEND);
+    KVPROT_INFO("KV cmd wait backend, handle:0x%llx opcode:%u cmd_id:%u nsid:%u.",
+        cmd->handle, cmd->trace.opcode, cmd->trace.cmd_id, cmd->trace.nsid);
+}
+
+void tgtKvCmdComplete(KVPROT_CMD *cmd, uint32_t status)
+{
+    if (cmd == NULL) {
+        return;
+    }
+
+    tgtKvFillResult(cmd, status);
+    cmd->trace.complete_time_ms = tgtKvGetTraceTimeMs();
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_COMPLETE);
+    if (status != KVPROT_CMD_STATUS_OK) {
+        tgtKvCmdDumpTrace(cmd, "complete error");
+    }
+    tgtKvCmdHandleFree(cmd);
+    tgtKvSendResponse(cmd);
+}
+
+int32_t tgtKvCmdCompleteByHandle(uint64_t handle, uint32_t status)
+{
+    KVPROT_CMD *cmd = tgtKvCmdClaimByHandle(handle);
+
+    if (cmd == NULL) {
+        KVPROT_ERROR("Complete kv command failed, invalid handle:0x%llx.", handle);
+        return RETURN_ERROR;
+    }
+
+    tgtKvCmdComplete(cmd, status);
+    return RETURN_OK;
 }
 
 static int32_t tgtKvScheduleToNormalPart(dplwt_entry_func entry_func, void *arg)
@@ -73,11 +291,16 @@ static int32_t tgtKvScheduleToNormalPart(dplwt_entry_func entry_func, void *arg)
 
 static int32_t tgtKvCmdRuntimeInit(void)
 {
+    (void)memset_s(&g_kvprot_cmd_handle_table, sizeof(g_kvprot_cmd_handle_table), 0,
+        sizeof(g_kvprot_cmd_handle_table));
+    spin_lock_init(&g_kvprot_cmd_handle_table.lock);
     return RETURN_OK;
 }
 
 static void tgtKvCmdRuntimeExit(void)
 {
+    (void)memset_s(&g_kvprot_cmd_handle_table, sizeof(g_kvprot_cmd_handle_table), 0,
+        sizeof(g_kvprot_cmd_handle_table));
 }
 
 static int32_t tgtKvIoCmdInit(void)
@@ -212,21 +435,28 @@ static int32_t tgtKvParseCmd(KVPROT_CMD *cmd)
 {
     uint16_t opcode;
 
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_PARSE);
+    cmd->trace.parse_time_ms = tgtKvGetTraceTimeMs();
     (void)memcpy_s(&cmd->sqe, sizeof(cmd->sqe), &cmd->drv_cmd.scat_cmd, sizeof(cmd->sqe));
     cmd->cqe.cmd_id = cmd->sqe.cmd_id;
     cmd->drv_cmd.result.cqe.cmd_id = cmd->cqe.cmd_id;
+    cmd->trace.opcode = cmd->sqe.opcode;
+    cmd->trace.cmd_id = cmd->sqe.cmd_id;
+    cmd->trace.nsid = cmd->sqe.nsid;
 
     opcode = cmd->sqe.opcode;
     cmd->entry = tgtKvGetCmdEntry(opcode);
     if (cmd->entry == NULL || cmd->entry->ops.execute == NULL) {
-        KVPROT_ERROR("Unsupported kv opcode:%u.", opcode);
+        KVPROT_ERROR("Unsupported kv opcode:%u handle:0x%llx.", opcode, cmd->handle);
         tgtKvFillResult(cmd, KVPROT_CMD_STATUS_INTERNAL_ERROR);
+        tgtKvCmdDumpTrace(cmd, "unsupported opcode");
         return RETURN_ERROR;
     }
 
     if (cmd->sqe.batch_num == 0) {
-        KVPROT_ERROR("Parse kv command failed, batch num is 0.");
+        KVPROT_ERROR("Parse kv command failed, batch num is 0 handle:0x%llx.", cmd->handle);
         tgtKvFillResult(cmd, KVPROT_CMD_STATUS_INTERNAL_ERROR);
+        tgtKvCmdDumpTrace(cmd, "invalid batch num");
         return RETURN_ERROR;
     }
     return tgtKvPrepareBatchResult(cmd);
@@ -235,13 +465,19 @@ static int32_t tgtKvParseCmd(KVPROT_CMD *cmd)
 
 static void tgtKvExecuteParsedCmd(KVPROT_CMD *cmd)
 {
-    int32_t ret = cmd->entry->ops.execute(cmd);
+    int32_t ret;
+
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_EXECUTE);
+    cmd->trace.execute_cpu = tgtKvGetCurrentCpu();
+    cmd->trace.execute_time_ms = tgtKvGetTraceTimeMs();
+
+    ret = cmd->entry->ops.execute(cmd);
 
     if (ret != RETURN_OK && cmd->cqe.status == KVPROT_CMD_STATUS_OK) {
         tgtKvFillResult(cmd, KVPROT_CMD_STATUS_INTERNAL_ERROR);
     }
 
-    tgtKvSendResponse(cmd);
+    tgtKvCmdComplete(cmd, cmd->cqe.status);
 }
 
 static void tgtKvExecuteParsedCmdWrapper(void *arg)
@@ -276,6 +512,20 @@ scat_tgt_cmd_s *tgtGetKvTargetCmd(OSP_VOID *session, scat_cmd_cqe_s *drv_cmd_cqe
 
     (void)memset_s(cmd, sizeof(KVPROT_CMD), 0, sizeof(KVPROT_CMD));
     cmd->drv_cmd.upper = cmd;
+    cmd->trace.alloc_cpu = tgtKvGetCurrentCpu();
+    cmd->trace.execute_cpu = KVPROT_CMD_CPU_INVALID;
+    cmd->trace.alloc_time_ms = tgtKvGetTraceTimeMs();
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_ALLOC);
+    if (tgtKvCmdHandleAlloc(cmd) == KVPROT_CMD_HANDLE_INVALID) {
+        FREE_STRUCTURE(cmd, g_kvprot_cmd_part_id);
+        if (drv_cmd_cqe != NULL) {
+            drv_cmd_cqe->status = KVPROT_CMD_STATUS_BUSY;
+        }
+        return NULL;
+    }
+    cmd->drv_cmd.cmd_sn = cmd->handle;
+    KVPROT_INFO("Get kv target cmd success, handle:0x%llx cpu:%u.",
+        cmd->handle, cmd->trace.alloc_cpu);
 
     if (drv_cmd_cqe != NULL) {
         drv_cmd_cqe->status = KVPROT_CMD_STATUS_OK;
@@ -302,20 +552,22 @@ void tgtParseKvTargetCmd(scat_tgt_cmd_s *drv_cmd)
 
     ret = tgtKvParseCmd(cmd);
     if (ret != RETURN_OK) {
-        tgtKvSendResponse(cmd);
+        tgtKvCmdComplete(cmd, cmd->cqe.status);
         return;
     }
 
     if (tgtKvNeedRxData(cmd)) {
         ret = tgtKvPrepareDataBuffer(cmd);
         if (ret != RETURN_OK) {
-            tgtKvSendResponse(cmd);
+            tgtKvCmdComplete(cmd, cmd->cqe.status);
             return;
         }
 
+        tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_WAIT_RX_DATA);
         ret = tgtKvRequestRxData(cmd);
         if (ret != RETURN_OK) {
-            tgtKvSendResponse(cmd);
+            tgtKvCmdComplete(cmd, cmd->cqe.status);
+            return;
         }
         return;
     }
@@ -325,10 +577,12 @@ void tgtParseKvTargetCmd(scat_tgt_cmd_s *drv_cmd)
         return;
     }
 
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_SCHEDULED);
     ret = tgtKvScheduleToNormalPart(tgtKvExecuteParsedCmdWrapper, (void *)cmd);
     if (ret != RETURN_OK) {
         tgtKvFillResult(cmd, KVPROT_CMD_STATUS_INTERNAL_ERROR);
-        tgtKvSendResponse(cmd);
+        tgtKvCmdComplete(cmd, cmd->cqe.status);
+        return;
     }
 }
 
@@ -348,15 +602,19 @@ void tgtTargetRxKvData(scat_tgt_cmd_s *drv_cmd)
         return;
     }
 
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_RX_DATA_DONE);
+    cmd->trace.rx_data_time_ms = tgtKvGetTraceTimeMs();
     if (!tgtKvNeedSchedule(cmd)) {
         tgtKvExecuteParsedCmd(cmd);
         return;
     }
 
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_SCHEDULED);
     ret = tgtKvScheduleToNormalPart(tgtKvExecuteParsedCmdWrapper, (void *)cmd);
     if (ret != RETURN_OK) {
         tgtKvFillResult(cmd, KVPROT_CMD_STATUS_INTERNAL_ERROR);
-        tgtKvSendResponse(cmd);
+        tgtKvCmdComplete(cmd, cmd->cqe.status);
+        return;
     }
 }
 
@@ -373,6 +631,7 @@ void tgtTargetTgtCmdDone(scat_tgt_cmd_s *drv_cmd)
         return;
     }
 
+    tgtKvCmdSetState(cmd, KVPROT_CMD_STATE_DONE);
     if (cmd->result_page_ctrl != NULL) {
         FREE_ONE_PAGE(cmd->result_page_ctrl, __FUNCTION__, __LINE__);
         cmd->result_page_ctrl = NULL;
@@ -383,6 +642,7 @@ void tgtTargetTgtCmdDone(scat_tgt_cmd_s *drv_cmd)
         cmd->data_page_ctrl = NULL;
     }
 
+    tgtKvCmdHandleFree(cmd);
     FREE_STRUCTURE(cmd, g_kvprot_cmd_part_id);
 }
 
