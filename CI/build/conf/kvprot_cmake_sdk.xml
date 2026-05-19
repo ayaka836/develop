@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root>
+    <build name="KVPROT" type="sdk" old_style="false" version="1.0.0.1" release="Beta" depends="" cmake_target="kvprot_sdk">
+        <pre>
+            <exec>CI/conf/cmc/prepare_haotiansdk.sh</exec>
+        </pre>
+        <post_depends>
+        </post_depends>
+        <source_list>
+        </source_list>
+        <sync_list>
+        </sync_list>
+    </build>
+</root>
