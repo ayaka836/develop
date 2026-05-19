@@ -1,12 +1,14 @@
 #ifndef KVPROT_KVPROT_H
 #define KVPROT_KVPROT_H
 
-#include <string>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-namespace kvprot {
+const char *kvprot_hello(void);
 
-std::string hello();
-
-} // namespace kvprot
+#ifdef __cplusplus
+}
+#endif
 
 #endif // KVPROT_KVPROT_H
