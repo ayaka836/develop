@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root>
+    <!--
+    配置编译信息：
+    name: 名称，与code club仓库的名称前缀一致
+    version: 发布版本信息
+    release: 子系统发布类型，如果子系统没有构建，则发布为Beta，如果构建完善，则发布为Compile
+    type：编译类型(sdk, img, cmpt)
+    old_style：包格式是否为老格式（initrd和pkg_root格式），目前仅ProductComm使用老格式
+    depends：依赖的包信息，使用","隔开，每个依赖为{name}-{type}
+    pre-exec：编译前预处理操作，每行一个，顺序执行
+    -->
+    <build name="KVCS" type="sdk" old_style="false" version="1.0.0.1" release="Beta" depends="" cmake_target="kvcs_sdk">
+         <!-- pre-exec：编译前预处理操作，每行一个，顺序执行 -->
+        <pre>
+            <exec>CI/conf/cmc/prepare_haotiansdk.sh</exec>
+            <exec>CI/conf/cmc/open_source/build_kvcs_local.sh</exec>
+            <exec>CI/conf/cmc/open_source/grpc_install.sh</exec>
+        </pre>
+         <!-- post-exec：依赖下载后，编译前执行，每行一个，顺序执行 怎么处理？-->
+        <post_depends>
+            <!-- <exec></exec> -->
+        </post_depends>
+        <!-- 配置需要编译的makefile.d的搜索路径 -->
+        <!-- 搜索 M(m)akefile开头，.d结尾 的文件 -->
+        <source_list>
+            <!-- <exec></exec> -->
+        </source_list>
+
+        <!-- 配置如果需要同步代码然后编译的同步路径，已在source_list中配置的无需再配置 -->
+        <sync_list>
+            <source>import_include/dorado</source>
+        </sync_list>
+        <!-- 配置打包checklist，如果不在存，则打包失败 -->
+        <!--
+        <check_list>
+            <item>script/swm_setup_disk.py</item>
+        </check_list>
+        -->
+    </build>
+</root>
