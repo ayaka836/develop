@@ -1,0 +1,5 @@
+#include "../../src/common/kvprot_common.c"
+#include "../../src/scat/kvprot_scat.c"
+#include "../../src/cmd/kvprot_delete.c"
+#include "../../src/cmd/kvprot_cmd.c"
+#include "../../src/init/kvprot_init.c"
